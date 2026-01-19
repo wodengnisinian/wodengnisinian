@@ -1,34 +1,19 @@
 # -*- coding: utf-8 -*-
-"""
-数据处理（原“按楼栋拆分导出”）—— PySide6/Qt，一体化界面与导出逻辑
-
-界面一：
-  - 按楼栋分表；宿舍号升序；序号=ROW()-1；表头可选字体/11；
-  - 条件格式标红：数字0 / 文本"0" / 文本"0.0"（可选）
-  - “总分为0明细”保留全部原始列；“目录”统计各分表行数
-
-界面二（新口径 + 你的两项新需求）：
-  - 只遍历 r'^[兰梅]苑\\d+号$' 楼栋表；
-  - 院系取第一个（逗号分隔，支持全角→半角）；去重键=(楼栋,宿舍号,院系first)；
-  - 指标：检查/优秀(≥90)/不合格(<60)/合格=检查-优秀-不合格；各率两位小数；
-  - 功能一：可选择排除「兰/梅苑 楼号 × 楼层(1–6) × 房间号(01–70)」的宿舍（按列值判断，与你的数据结构一致）；
-  - 功能二：唯一去除性——排除总分为 0/0.0（文本或数值）；
-  - 输出：表一_优秀与不及格、表二_检查与各率、日志_口径与忽略说明。
-"""
-
 from __future__ import annotations
 
 # ===== 版本信息 =====
 """Metadata for the building-based exporter."""
 
-__version__ = "1.1.0.14"
+__version__ = "1.1.0.16"
 __build_note__ = (
     "整合为单一数据处理脚本，保留统一清洗链；运行日志入口移至主界面左侧按钮区域，设置弹窗精简通用页；",
     "修复清洗阶段缺失列（如班级）导致统计中断的问题；",
     "界面二分组统计强化院系标量化，避免 first_dept 维度异常；",
     "运行日志增强：记录输入/输出与处理统计，界面一条件格式在空表时不再触发异常；",
     "界面二原始数据统一从“原始数据输入”弹窗获取，路径缺失时自动唤起弹窗提醒；",
-    "界面一新增寝室院系多数决选项，可按人数占比统一院系判定"
+    "界面一新增寝室院系多数决选项，可按人数占比统一院系判定",
+    "界面一与界面二原始数据合并为同一输入文件路径，共用同一份明细数据。",
+    "界面二“排除文本 0/0.0”选项调整为仅排除文本 0.0（含 0.00/0.000分 等写法），界面一总分为0明细逻辑保持不变。"
 )
 __history__ = """
 1.0.0.0: 初始版本发布。
@@ -45,7 +30,7 @@ import json
 import datetime as dt
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Iterable, List, Dict, Tuple, Optional, Set
+from typing import Iterable, List, Dict, Tuple, Optional, Set, Any, Callable
 
 import pandas as pd
 import numpy as np
@@ -203,7 +188,7 @@ def scgjwk(df: pd.DataFrame, building_col: str = "楼栋", room_col: str = "宿�
 
 def sshszh(series: pd.Series) -> pd.Series:
     """宿舍号数字化：解析数字，无法转换则返回 NaN。"""
-    return series.map(extract_room_num)
+    return series.map(lambda x: extract_room_num(x))
 
 
 def zfshzh(series: pd.Series) -> pd.Series:
@@ -211,32 +196,76 @@ def zfshzh(series: pd.Series) -> pd.Series:
     return series.map(parse_score)
 
 
-def flzf0(df: pd.DataFrame, score_col: str, drop_text_zero: bool, drop_numeric_zero: bool) -> Tuple[
-    pd.DataFrame, pd.DataFrame]:
-    """分离总分为 0 的记录，返回（非 0 数据，0 分数据）。"""
+def _is_text_zero_0dot0_only(s: str) -> bool:
+    """
+    专供界面二使用：仅把“0.0/0.00/0.000/0.0分/0.00分...”视为文本 0 分，
+    不再把纯“0/0分”当作文本 0。
+    """
+    if not s:
+        return False
+    txt = re.sub(r"\s+", "", s).replace("分", "")
+    # 至少有一个小数点
+    if "." not in txt:
+        return False
+    m = re.fullmatch(r"0\.0+", txt)
+    return bool(m)
+
+
+def flzf0(
+    df: pd.DataFrame,
+    score_col: str,
+    drop_text_zero: bool,
+    drop_numeric_zero: bool,
+    *,
+    text_mode: str = "both",
+    extra_text_pred: Optional[Callable[[str], bool]] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    分离总分为 0 的记录，返回（非 0 数据，0 分数据）。
+
+    参数含义：
+    - drop_text_zero: 是否按“文本写法”去零；
+    - drop_numeric_zero: 是否按“数值结果”为 0 去零；
+    - text_mode:
+        * "both"       : 文本 0 / 0.0 / 0分 / 0.0分 ... 都算文本 0 （界面一/旧逻辑）
+        * "only_0dot0" : 仅把 “0.0 / 0.00 / 0.000 / 0.0分 / 0.00分 …” 视为文本 0（界面二）
+    - extra_text_pred: 额外的文本判断函数，可选。
+    """
+    # 原始文本列
     score_raw = df[score_col].map(normalize_plain_text)
+    # 数值列
     score_num = score_raw.map(parse_score)
 
-    masks: List[pd.Series] = []
     text_zero = pd.Series(False, index=df.index)
     num_zero = pd.Series(False, index=df.index)
+
+    # ---------- 文本 0 判定 ----------
     if drop_text_zero:
-        text_zero = score_raw.map(lambda x: bool(ZERO_TEXT_RE.match(str(x).strip())))
-        masks.append(text_zero)
+        if text_mode == "only_0dot0":
+            text_zero = score_raw.map(_is_text_zero_0dot0_only)
+        else:
+            text_zero = score_raw.map(
+                lambda x: bool(ZERO_TEXT_RE.match(str(x).strip()))
+            )
+
+        if extra_text_pred is not None:
+            text_zero = text_zero | score_raw.map(
+                lambda x: bool(extra_text_pred(str(x)))
+            )
+
+    # ---------- 数值 0 判定 ----------
     if drop_numeric_zero:
         num_zero = score_num.fillna(np.nan) == 0
-        masks.append(num_zero)
 
-    if not masks:
+    if not drop_text_zero and not drop_numeric_zero:
         return df.copy(), df.iloc[0:0].copy()
 
-    mask_zero = masks[0]
-    for m in masks[1:]:
-        mask_zero = mask_zero | m
+    mask_zero = text_zero | num_zero
 
     zero_df = df[mask_zero].copy()
     zero_df["_zero_text"] = text_zero.loc[mask_zero].fillna(False)
     zero_df["_zero_num"] = num_zero.loc[mask_zero].fillna(False)
+
     keep_df = df[~mask_zero].copy()
     return keep_df, zero_df
 
@@ -596,9 +625,6 @@ def drop_rectified_rows(report_df: pd.DataFrame,
                         match_by_room_only: bool = True,
                         require_department: bool = False) -> pd.DataFrame:
     """按照“学风简报中心”删行口径，移除已整改寝室（要求 39-40）。"""
-    # UI 约定：
-    #  - 勾选“仅按楼栋+宿舍号匹配” → 永远只用两元键。
-    #  - 未勾选且勾“需要院系同时匹配” → 三元键；未勾选且不勾第二项 → 仍按两元键。
     include_dept = (not match_by_room_only) and require_department
 
     def _build_key(row: pd.Series) -> Optional[Tuple[str, str, Optional[str]]]:
@@ -625,12 +651,7 @@ def drop_rectified_rows(report_df: pd.DataFrame,
 
 
 def load_tabular_file(path: str) -> pd.DataFrame:
-    """加载 Excel/Word/PDF 为 DataFrame，用于“简报中心”导入。
-
-    - Excel：直接通过 pandas 解析。
-    - Word：依赖 python-docx，合并所有包含“楼栋/宿舍号”表头的表格，否则取首张非空表。
-    - PDF：依赖 pdfplumber，合并所有包含关键列的表格，若无命中则回退首张非空表。
-    """
+    """加载 Excel/Word/PDF 为 DataFrame，用于“简报中心”导入。"""
 
     target_cols = {"楼栋", "宿舍号"}
 
@@ -647,7 +668,6 @@ def load_tabular_file(path: str) -> pd.DataFrame:
         data = cleaned[header_idx + 1:] if len(cleaned) > header_idx + 1 else []
         col_count = len(header)
         if any(len(r) != col_count for r in data):
-            # 对齐列数
             fixed = []
             for r in data:
                 row = (r + [""] * col_count)[:col_count]
@@ -663,7 +683,7 @@ def load_tabular_file(path: str) -> pd.DataFrame:
     if ext in (".doc", ".docx"):
         try:
             import docx  # type: ignore
-        except Exception as exc:  # pragma: no cover - 运行时缺依赖才触发
+        except Exception as exc:
             raise ImportError("解析 Word 需要安装 python-docx 库。") from exc
 
         doc = docx.Document(path)
@@ -687,7 +707,7 @@ def load_tabular_file(path: str) -> pd.DataFrame:
     if ext == ".pdf":
         try:
             import pdfplumber  # type: ignore
-        except Exception as exc:  # pragma: no cover - 运行时缺依赖才触发
+        except Exception as exc:
             raise ImportError("解析 PDF 需要安装 pdfplumber 库。") from exc
 
         fallback = None
@@ -744,11 +764,17 @@ def if2_load_and_clean(input_path: str,
         logs["policy"].append("按楼栋配置区间/单间排除宿舍。")
         logs["policy"].append("排除条件：" + describe_exclusion(ex))
     if drop_zero_text:
-        logs["policy"].append("排除总分文本为 0/0.0/0分 等写法。")
+        logs["policy"].append("排除总分文本为 0.0（含 0.00/0.000分 等写法，仅界面二）。")
     if drop_zero_numeric:
         logs["policy"].append("排除总分数值为 0。")
     if use_majority_dept:
         logs["policy"].append("寝室院系由人数占比决定，平局时回退至单元格首个院系。")
+
+    # ✅ 追加一条“本次开关状态”说明，方便日志查看
+    logs["policy"].append(
+        f"本次去零开关：文本0.0={'开启' if drop_zero_text else '关闭'}；数值0={'开启' if drop_zero_numeric else '关闭'}；"
+        f"区间排查={'开启' if ex.get('enabled') else '关闭'}。"
+    )
 
     stats = {
         "sheets_total": len(xls.sheet_names),
@@ -770,7 +796,8 @@ def if2_load_and_clean(input_path: str,
         must_cols = {"楼栋", "宿舍号", "院系", "总分"}
         if not must_cols.issubset(df.columns):
             if sheet_name:
-                logs["ignored_missing_columns"].append(f"{sheet_name}（缺列：{sorted(must_cols - set(df.columns))}）")
+                missing = sorted(must_cols - set(df.columns))
+                logs["ignored_missing_columns"].append(f"{sheet_name}（缺列：{missing}）")
             return
 
         for optional in ("班级",):
@@ -794,15 +821,25 @@ def if2_load_and_clean(input_path: str,
         df["first_dept"] = first_dept
         stats["rows_after_structure"] += len(df)
 
-        df, zero_df = flzf0(df, "总分", drop_zero_text, drop_zero_numeric)
+        # === 去零：界面二只对文本 0.0 做“文本去零”，数值 0 独立控制 ===
+        df, zero_df = flzf0(
+            df,
+            "总分",
+            drop_text_zero=drop_zero_text,
+            drop_numeric_zero=drop_zero_numeric,
+            text_mode="only_0dot0",
+        )
         if isinstance(zero_df, pd.DataFrame):
             if "_zero_text" in zero_df.columns:
                 stats["zero_text_removed"] += int(zero_df["_zero_text"].sum())
             if "_zero_num" in zero_df.columns:
                 stats["zero_numeric_removed"] += int(zero_df["_zero_num"].sum())
+
         df = df[df["first_dept"].apply(is_valid_department)].copy()
         df["总分_num"] = zfshzh(df["总分"])
         stats["rows_valid_dept"] += len(df)
+        # ✅ 记录“去零后（且院系有效）行数”
+        stats["rows_after_zero"] += len(df)
 
         before_ex = len(df)
         df = yyqjpc(df, ex)
@@ -846,7 +883,6 @@ def if2_load_and_clean(input_path: str,
 
     all_df["first_dept_final"] = all_df["first_dept_final"].map(ensure_scalar_department)
     all_df = all_df[all_df["first_dept_final"].isin(PRESET_DEPTS_IF2)]
-    stats["rows_after_zero"] = int(len(all_df))
     all_df = ajqc(all_df, ["楼栋", "宿舍号", "first_dept_final"])
     all_df = all_df.rename(columns={"first_dept_final": "first_dept"})
     all_df["first_dept"] = all_df["first_dept"].map(ensure_scalar_department)
@@ -936,17 +972,14 @@ def if2_save_excel(
     table1: pd.DataFrame,
     table2: pd.DataFrame,
     logs: Dict[str, List[str]],
+    stats: Dict[str, int],
     output_path: str
 ) -> None:
     """
     界面二：按模板输出 3 个工作表：
     1）优秀与不及格表
     2）检查与各率（公式与模板一致）
-    3）日志（日期 + 操作内容）
-    说明：
-    - 依赖全局常量 OUTPUT_ORDER_IF2（系部顺序）、TOTAL_ROW_NAME_IF2（'总计'）
-    - table1: 列含 ['系部', '优秀寝室', '不合格寝室']，且有一行系部=TOTAL_ROW_NAME_IF2
-    - table2: 列含 ['系部', '检查寝室/间', '优秀寝室/间', '不合格寝室/间']
+    3）日志（日期 + 操作内容），日志中增加数据概况、阶段占比、去零/排除统计。
     """
     with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
         wb = writer.book
@@ -981,14 +1014,14 @@ def if2_save_excel(
             if col in t2.columns:
                 t2[col] = pd.to_numeric(t2[col], errors="coerce").fillna(0).astype(int)
 
+        # 小工具：安全计算百分比
+        def _pct(num: int, den: int) -> str:
+            if not den:
+                return "0%"
+            return f"{(num / den) * 100:.2f}%"
+
         # =====================================================
         #  Sheet1：优秀与不及格表
-        #  结构与模板完全一致：
-        #  A：序号 (=ROW()-1)
-        #  B：系部
-        #  C：优秀寝室
-        #  D：不合格寝室
-        #  最后一行：总计，C/D 为 SUM()
         # =====================================================
         sheet1_name = "优秀与不及格表"
         ws1 = wb.add_worksheet(sheet1_name)
@@ -997,7 +1030,6 @@ def if2_save_excel(
         for col, h in enumerate(headers1):
             ws1.write(0, col, h, header_fmt)
 
-        # 按固定顺序 OUTPUT_ORDER_IF2 写 8 个系部
         ordered_rows: List[Dict[str, Any]] = []
         for dept in OUTPUT_ORDER_IF2:
             row = t1[t1["系部"] == dept]
@@ -1011,7 +1043,6 @@ def if2_save_excel(
                     "不合格寝室": int(r0.get("不合格寝室", 0)),
                 })
 
-        # 从 table1 里取“总计”那一行（如果没有就自己求和）
         total_row = t1[t1["系部"] == TOTAL_ROW_NAME_IF2]
         if not total_row.empty:
             tr = total_row.iloc[0]
@@ -1021,24 +1052,19 @@ def if2_save_excel(
             total_excellent = sum(r["优秀寝室"] for r in ordered_rows)
             total_fail = sum(r["不合格寝室"] for r in ordered_rows)
 
-        # 数据从第 2 行开始（0-based 行号 1）
         start_row_s1 = 1
         for i, r in enumerate(ordered_rows):
-            row_idx = start_row_s1 + i          # 0-based
-            excel_row_no = row_idx + 1          # Excel 行号（1-based）
-            # A：序号
+            row_idx = start_row_s1 + i
+            excel_row_no = row_idx + 1
             ws1.write_formula(row_idx, 0, "=ROW()-1", cell_fmt)
-            # B：系部
             ws1.write(row_idx, 1, r["系部"], cell_fmt)
-            # C / D：数量
             ws1.write_number(row_idx, 2, r["优秀寝室"], cell_fmt)
             ws1.write_number(row_idx, 3, r["不合格寝室"], cell_fmt)
 
-        # 总计行：放在 8 个系部下面一行
-        total_row_idx_s1 = start_row_s1 + len(ordered_rows)  # 0-based
-        total_excel_row_s1 = total_row_idx_s1 + 1            # Excel 行号
-        first_data_excel_row_s1 = start_row_s1 + 1           # 2
-        last_data_excel_row_s1 = first_data_excel_row_s1 + len(ordered_rows) - 1  # 9
+        total_row_idx_s1 = start_row_s1 + len(ordered_rows)
+        total_excel_row_s1 = total_row_idx_s1 + 1
+        first_data_excel_row_s1 = start_row_s1 + 1
+        last_data_excel_row_s1 = first_data_excel_row_s1 + len(ordered_rows) - 1
 
         ws1.write_formula(total_row_idx_s1, 0, "=ROW()-1", cell_fmt)
         ws1.write(total_row_idx_s1, 1, TOTAL_ROW_NAME_IF2, cell_fmt)
@@ -1053,32 +1079,12 @@ def if2_save_excel(
             cell_fmt,
         )
 
-        # 列宽稍微拉一下
-        ws1.set_column(0, 0, 8)   # 序号
-        ws1.set_column(1, 1, 16)  # 系部
-        ws1.set_column(2, 3, 14)  # 数量列
+        ws1.set_column(0, 0, 8)
+        ws1.set_column(1, 1, 16)
+        ws1.set_column(2, 3, 14)
 
         # =====================================================
         #  Sheet2：检查与各率
-        #  结构 & 公式 完全按照你的模板来：
-        #  A：序号 (=ROW()-1)
-        #  B：系部
-        #  C：检查寝室/间（直接写数值）
-        #  D：=‘优秀与不及格表’!C行号
-        #  E：=IF(C行号>0,D行号/C行号,0)   百分比格式
-        #  F：=C行号-D行号-H行号
-        #  G：=IF(C行号>0,F行号/C行号,0)   百分比格式
-        #  H：=‘优秀与不及格表’!D行号
-        #  I：=IF(C行号>0,H行号/C行号,0)   百分比格式
-        #
-        #  最后一行（合计行）：
-        #  C：=SUM(C2:C9)
-        #  D：=‘优秀与不及格表’!C10
-        #  E：=IF(C10>0,D10/C10,0)
-        #  F：=C10-D10-H10
-        #  G：=IF(C10>0,F10/C10,0)
-        #  H：=‘优秀与不及格表’!D10
-        #  I：=IF(C10>0,H10/C10,0)
         # =====================================================
         sheet2_name = "检查与各率"
         ws2 = wb.add_worksheet(sheet2_name)
@@ -1090,7 +1096,6 @@ def if2_save_excel(
         for col, h in enumerate(headers2):
             ws2.write(0, col, h, header_fmt)
 
-        # dept -> (检查, 优秀, 不合格)
         dept_counts: Dict[str, Tuple[int, int, int]] = {}
         if not t2.empty:
             for _, row in t2.iterrows():
@@ -1100,102 +1105,85 @@ def if2_save_excel(
                 fail = int(row.get("不合格寝室/间", 0))
                 dept_counts[dept] = (chk, exc, fail)
 
-        start_row_s2 = 1  # 数据从第 2 行开始（0-based）
+        start_row_s2 = 1
         for i, dept in enumerate(OUTPUT_ORDER_IF2):
             row_idx = start_row_s2 + i
-            excel_row_no = row_idx + 1  # Excel 行号（2~9）
+            excel_row_no = row_idx + 1
 
             chk, exc, fail = dept_counts.get(dept, (0, 0, 0))
 
-            # A：序号
             ws2.write_formula(row_idx, 0, "=ROW()-1", cell_fmt)
-            # B：系部
             ws2.write(row_idx, 1, dept, cell_fmt)
-            # C：检查寝室/间（直接写数值）
             ws2.write_number(row_idx, 2, chk, cell_fmt)
-            # D：优秀寝室/间 = '优秀与不及格表'!C行号
             ws2.write_formula(
                 row_idx, 3,
                 f"='{sheet1_name}'!C{excel_row_no}",
                 cell_fmt,
             )
-            # E：优秀率 = IF(C>0,D/C,0)
             ws2.write_formula(
                 row_idx, 4,
                 f"=IF(C{excel_row_no}>0,D{excel_row_no}/C{excel_row_no},0)",
                 pct_fmt,
             )
-            # H：不合格寝室/间 = '优秀与不及格表'!D行号
             ws2.write_formula(
                 row_idx, 7,
                 f"='{sheet1_name}'!D{excel_row_no}",
                 cell_fmt,
             )
-            # F：合格寝室/间 = C-D-H
             ws2.write_formula(
                 row_idx, 5,
                 f"=C{excel_row_no}-D{excel_row_no}-H{excel_row_no}",
                 cell_fmt,
             )
-            # G：合格率 = IF(C>0,F/C,0)
             ws2.write_formula(
                 row_idx, 6,
                 f"=IF(C{excel_row_no}>0,F{excel_row_no}/C{excel_row_no},0)",
                 pct_fmt,
             )
-            # I：不合格率 = IF(C>0,H/C,0)
             ws2.write_formula(
                 row_idx, 8,
                 f"=IF(C{excel_row_no}>0,H{excel_row_no}/C{excel_row_no},0)",
                 pct_fmt,
             )
 
-        # 合计行（第 10 行）
-        total_row_idx_s2 = start_row_s2 + len(OUTPUT_ORDER_IF2)  # 0-based
-        total_excel_row_s2 = total_row_idx_s2 + 1               # Excel 行号（10）
-        first_data_excel_row_s2 = start_row_s2 + 1              # 2
-        last_data_excel_row_s2 = first_data_excel_row_s2 + len(OUTPUT_ORDER_IF2) - 1  # 9
+        total_row_idx_s2 = start_row_s2 + len(OUTPUT_ORDER_IF2)
+        total_excel_row_s2 = total_row_idx_s2 + 1
+        first_data_excel_row_s2 = start_row_s2 + 1
+        last_data_excel_row_s2 = first_data_excel_row_s2 + len(OUTPUT_ORDER_IF2) - 1
 
         ws2.write_formula(total_row_idx_s2, 0, "=ROW()-1", cell_fmt)
         ws2.write(total_row_idx_s2, 1, "合计", cell_fmt)
 
-        # C：检查合计
         ws2.write_formula(
             total_row_idx_s2, 2,
             f"=SUM(C{first_data_excel_row_s2}:C{last_data_excel_row_s2})",
             cell_fmt,
         )
-        # D：优秀寝室合计 = '优秀与不及格表'!C10
         ws2.write_formula(
             total_row_idx_s2, 3,
             f"='{sheet1_name}'!C{total_excel_row_s1}",
             cell_fmt,
         )
-        # E：优秀率合计 = IF(C10>0,D10/C10,0)
         ws2.write_formula(
             total_row_idx_s2, 4,
             f"=IF(C{total_excel_row_s2}>0,D{total_excel_row_s2}/C{total_excel_row_s2},0)",
             pct_fmt,
         )
-        # H：不合格寝室合计 = '优秀与不及格表'!D10
         ws2.write_formula(
             total_row_idx_s2, 7,
             f"='{sheet1_name}'!D{total_excel_row_s1}",
             cell_fmt,
         )
-        # F：合格寝室/间合计 = C10-D10-H10
         ws2.write_formula(
             total_row_idx_s2, 5,
             f"=C{total_excel_row_s2}-D{total_excel_row_s2}-H{total_excel_row_s2}",
             cell_fmt,
         )
-        # G：合格率合计
         ws2.write_formula(
             total_row_idx_s2, 6,
             f"=IF(C{total_excel_row_s2}>0,F{total_excel_row_s2}/C{total_excel_row_s2},0)",
             pct_fmt,
         )
-        # I：不合格率合计
         ws2.write_formula(
             total_row_idx_s2, 8,
             f"=IF(C{total_excel_row_s2}>0,H{total_excel_row_s2}/C{total_excel_row_s2},0)",
@@ -1207,9 +1195,7 @@ def if2_save_excel(
         ws2.set_column(2, 8, 14)
 
         # =====================================================
-        #  Sheet3：日志
-        #  结构： 日期 | 操作内容
-        #  把口径 + 忽略信息简要写进去
+        #  Sheet3：日志（详细到爆炸）
         # =====================================================
         wslog = wb.add_worksheet("日志")
         wslog.write(0, 0, "日期", header_fmt)
@@ -1218,9 +1204,79 @@ def if2_save_excel(
         ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_lines: List[str] = []
 
+        def _s(key: str) -> int:
+            if not stats:
+                return 0
+            try:
+                return int(stats.get(key, 0))
+            except Exception:
+                return 0
+
+        rows_raw = _s("rows_raw")
+        rows_struct = _s("rows_after_structure")
+        rows_valid_dept = _s("rows_valid_dept")
+        rows_after_zero = _s("rows_after_zero")
+        rows_after_ex = _s("rows_after_exclusion")
+        rows_final = _s("rows_final")
+        z_text = _s("zero_text_removed")
+        z_num = _s("zero_numeric_removed")
+        excl = _s("excluded_rows")
+        sheets_total = _s("sheets_total")
+        sheets_used = _s("sheets_used")
+        sheets_other = max(sheets_total - sheets_used, 0)
+
         policies = logs.get("policy", [])
         if policies:
             log_lines.append("统计口径：" + "；".join(policies))
+
+        if rows_raw or rows_final:
+            overview = (
+                f"运行概况：原始行={rows_raw}；"
+                f"结构化后={rows_struct}；"
+                f"有效院系行={rows_valid_dept}；"
+                f"去零后={rows_after_zero}；"
+                f"区间/单间排除后={rows_after_ex}；"
+                f"最终统计行={rows_final}。"
+            )
+            log_lines.append(overview)
+
+            phase = (
+                "阶段占比："
+                f"结构化/原始={_pct(rows_struct, rows_raw)}；"
+                f"有效院系/结构化={_pct(rows_valid_dept, rows_struct)}；"
+                f"去零后/有效院系={_pct(rows_after_zero, rows_valid_dept)}；"
+                f"排除后/去零后={_pct(rows_after_ex, rows_after_zero)}；"
+                f"最终/原始={_pct(rows_final, rows_raw)}。"
+            )
+            log_lines.append(phase)
+
+        if z_text or z_num:
+            detail_parts: List[str] = []
+            if z_text:
+                detail_parts.append(
+                    f"文本 0.0 行数={z_text}（占结构化行 {_pct(z_text, rows_struct)}）"
+                )
+            if z_num:
+                detail_parts.append(
+                    f"数值 0 行数={z_num}（占结构化行 {_pct(z_num, rows_struct)}）"
+                )
+            log_lines.append("去零明细：" + "；".join(detail_parts))
+        else:
+            log_lines.append("去零明细：本次未检测到文本 0.0 或数值 0 需要排除的记录。")
+
+        if excl:
+            log_lines.append(
+                f"区间/单间排除：共排除 {excl} 行（占去零后行 {_pct(excl, rows_after_zero)}）。"
+            )
+        else:
+            log_lines.append("区间/单间排除：未配置或未命中需排除的寝室。")
+
+        if sheets_total:
+            log_lines.append(
+                f"工作表统计：总工作表数={sheets_total}；"
+                f"被识别为楼栋表={sheets_used}；"
+                f"其它类型工作表={sheets_other}。"
+            )
 
         for key, label in [
             ("used_building_sheets", "已使用楼栋表"),
@@ -1295,17 +1351,28 @@ def build_workbook_bytes(
         dept_dictionary: Dict[str, Dict[str, List[str]]],
         use_majority_dept: bool,
 ) -> Tuple[bytes, Dict[str, int]]:
+    """
+    界面一：
+      - 每栋 6 张正常表（你原来按楼栋拆分那套）
+      - 额外 2 张总表（不及格寝室明细 / 0.0分寝室明细）
+      - 目录 + 版本信息 保留
+      - ✅ 每张明细表首行开启筛选
+      - ✅ 不及格明细按“楼栋 + 宿舍号”从小到大排序
+    """
+    # 先加载/清洗明细
     df1, meta = load_detail_dataframe(input_path, dept_dictionary)
     cols_required = DETAIL_COLUMNS
     sheet = meta["sheet"]
 
+    # 多数决院系（可选）
     if use_majority_dept and not df1.empty:
         df1["院系"] = (
-            df1.groupby(["楼栋_norm", "宿舍号"])['院系']
+            df1.groupby(["楼栋_norm", "宿舍号"])["院系"]
             .transform(pick_majority)
             .fillna(df1["院系"])
         )
 
+    # 拆出一个精简视图用于楼栋分表
     slim = df1[["序号", "楼栋_norm", "宿舍号", "院系", "总分", "总分_rawstr"]].copy()
 
     def sort_key_bld(x):
@@ -1325,9 +1392,33 @@ def build_workbook_bytes(
     else:
         targets = candidates
 
-    _keep_stats, zero_full = flzf0(df1, "总分_rawstr", True, True)
-    zero_full = zero_full[["序号", "楼栋", "宿舍号", "院系", "总分",
-                           "班级", "学生姓名", "评分状态", "检查时间", "打分原因", "总分_rawstr"]].copy()
+    # ==== 这里重新做一次总分解析，给 2 张汇总表用 ====
+    df_full = df1.copy()
+
+    # 保障文本列干净
+    df_full["总分_rawstr"] = df_full["总分_rawstr"].map(normalize_plain_text)
+    df_full["总分_num"] = df_full["总分_rawstr"].map(parse_score)
+
+    score_raw = df_full["总分_rawstr"]
+    score_num = df_full["总分_num"]
+
+    # 0.0 分表：仅保留“0.0 / 0.00 / 0.000 / 0.0分 / 0.00分 …”这类写法
+    zero_mask = score_raw.map(_is_text_zero_0dot0_only)
+    zero_df = df_full[zero_mask].copy()
+
+    # 不及格表：0 ≤ 总分 < 60，排除掉已经进 0.0 分表的行
+    # （只要 parse_score 有效数值即可，NaN 自动被排除）
+    fail_mask = score_num.notna() & (score_num >= 0) & (score_num < 60) & (~zero_mask)
+    fail_df = df_full[fail_mask].copy()
+
+    # ✅【新增】按“楼栋 + 宿舍号”排序不及格/0.0 明细
+    # 使用已有的 room_sort_key，保证“101, 102, 201...”这种自然顺序
+    for _tmp in (fail_df, zero_df):
+        if not _tmp.empty:
+            _tmp["_room_key_"] = _tmp["宿舍号"].map(room_sort_key)
+            # 楼栋内按宿舍号升序；也可以只按 _room_key_ 排，如果你想完全无视楼栋顺序的话
+            _tmp.sort_values(by=["楼栋_norm", "_room_key_"], inplace=True)
+            _tmp.drop(columns=["_room_key_"], inplace=True)
 
     import xlsxwriter
 
@@ -1336,20 +1427,31 @@ def build_workbook_bytes(
         "sheet": sheet,
         "raw_rows": meta["raw_rows"],
         "valid_rows": meta["valid_rows"],
-        "zero_rows": int(len(zero_full)),
-        "sheet_count": int(len(targets)),
+        "sheet_count": int(len(targets)),       # 楼栋表数量
+        "fail_rows": int(len(fail_df)),         # 不及格寝室条数（含 0 分，但已排除 0.0 系）
+        "zero_rows": int(len(zero_df)),         # 0.0 分条数
     }
+
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
         wb = writer.book
-        header_bold = wb.add_format({"bold": True, "font_name": font_name, "font_size": 11,
-                                     "align": "center", "valign": "vcenter", "border": 1})
-        header_norm = wb.add_format({"bold": False, "font_name": font_name, "font_size": 11,
-                                     "align": "center", "valign": "vcenter", "border": 1})
-        cell_fmt = wb.add_format({"font_name": font_name, "font_size": 11,
-                                  "align": "center", "valign": "vcenter", "border": 1})
-        red_fill = wb.add_format({"font_name": font_name, "font_size": 11, "bg_color": "#FFCCCC"})
+        header_bold = wb.add_format({
+            "bold": True, "font_name": font_name, "font_size": 11,
+            "align": "center", "valign": "vcenter", "border": 1
+        })
+        header_norm = wb.add_format({
+            "bold": False, "font_name": font_name, "font_size": 11,
+            "align": "center", "valign": "vcenter", "border": 1
+        })
+        cell_fmt = wb.add_format({
+            "font_name": font_name, "font_size": 11,
+            "align": "center", "valign": "vcenter", "border": 1
+        })
+        red_fill = wb.add_format({
+            "font_name": font_name, "font_size": 11,
+            "bg_color": "#FFCCCC"
+        })
 
-        # ---------- 界面一 ----------
+        # ---------- 界面一：楼栋分表（每栋 6 张内部分表，逻辑保持不变） ----------
         summary_rows = []
         keep_headers = ["序号", "楼栋", "宿舍号", "院系", "总分"]
         for name in targets:
@@ -1386,23 +1488,50 @@ def build_workbook_bytes(
                 if mark_text_zero_dot:
                     ws.conditional_format(rng, {"type": "formula", "criteria": '=$F2="0.0"', "format": red_fill})
 
+                # ✅【新增】首行开启筛选
+                ws.autofilter(0, 0, nrows, len(headers) - 1)
+
             summary_rows.append([ws_name, nrows])
 
-        # 总分为0明细
-        sp = zero_full.rename(columns={"总分_rawstr": "总分原值(隐藏)"})
-        sp_name = "总分为0明细"
-        sp.to_excel(writer, sheet_name=sp_name, index=False, header=False, startrow=1)
-        ws_sp = writer.sheets[sp_name]
-        cols_all = ["序号", "楼栋", "宿舍号", "院系", "总分", "班级", "学生姓名", "评分状态", "检查时间", "打分原因",
-                    "总分原值(隐藏)"]
-        for j, col in enumerate(cols_all):
-            fmt = header_bold if col in ["序号", "楼栋", "宿舍号", "院系", "总分"] else header_norm
-            ws_sp.write(0, j, col, fmt)
-        ws_sp.set_row(0, 18)
-        ws_sp.set_column(0, len(cols_all) - 1, 12, cell_fmt)
-        ws_sp.set_column(len(cols_all) - 1, len(cols_all) - 1, None, None, {"hidden": True})
-        for r in range(1, len(sp) + 1):
-            ws_sp.write_formula(r, 0, "=ROW()-1", cell_fmt)
+        # ---------- 2 张总表：不及格寝室明细 / 0.0分寝室明细 ----------
+        def _export_special(df_src: pd.DataFrame, sheet_name: str):
+            if df_src.empty:
+                # 空表就不建工作表，避免一堆空 sheet
+                return
+
+            # 防止有列缺失，缺的先补空
+            base_cols = [
+                "序号", "楼栋", "宿舍号", "院系", "总分",
+                "班级", "学生姓名", "评分状态", "检查时间", "打分原因",
+            ]
+            for col in base_cols:
+                if col not in df_src.columns:
+                    df_src[col] = ""
+
+            sp = df_src[base_cols + ["总分_rawstr"]].copy()
+            sp = sp.rename(columns={"总分_rawstr": "总分原值(隐藏)"})
+
+            sp.to_excel(writer, sheet_name=sheet_name, index=False, header=False, startrow=1)
+            ws_sp = writer.sheets[sheet_name]
+
+            cols_all = base_cols + ["总分原值(隐藏)"]
+            for j, col in enumerate(cols_all):
+                fmt = header_bold if col in ["序号", "楼栋", "宿舍号", "院系", "总分"] else header_norm
+                ws_sp.write(0, j, col, fmt)
+
+            ws_sp.set_row(0, 18)
+            ws_sp.set_column(0, len(cols_all) - 1, 12, cell_fmt)
+            # 隐藏“总分原值(隐藏)”列
+            ws_sp.set_column(len(cols_all) - 1, len(cols_all) - 1, None, None, {"hidden": True})
+
+            for r in range(1, len(sp) + 1):
+                ws_sp.write_formula(r, 0, "=ROW()-1", cell_fmt)
+
+            # ✅【新增】不及格/0.0 明细也加上筛选
+            ws_sp.autofilter(0, 0, len(sp), len(cols_all) - 1)
+
+        _export_special(fail_df, "不及格寝室明细")
+        _export_special(zero_df, "0.0分寝室明细")
 
         # 目录
         toc = pd.DataFrame(summary_rows, columns=["工作表名", "行数"])
@@ -1421,11 +1550,12 @@ def build_workbook_bytes(
         try:
             meta_df.to_excel(writer, sheet_name="版本信息", index=False)
         except Exception:
+            # 某些极端情况下 sheet 名冲突就算了，不影响主流程
             pass
 
     buffer.seek(0)
-    summary_meta["toc_rows"] = int(len(summary_rows))
     return buffer.getvalue(), summary_meta
+
 
 
 # ---------------- 任务线程 ---------------- #
@@ -1523,7 +1653,7 @@ class WorkerIface2(QThread):
             self.progress.emit(45)
             table1, table2 = if2_build_tables(all_df)
             self.progress.emit(70)
-            if2_save_excel(table1, table2, logs, self.output_path)
+            if2_save_excel(table1, table2, logs, stats, self.output_path)
             self.progress.emit(100)
             self.finished.emit(self.output_path)
         except Exception as e:
@@ -1694,7 +1824,7 @@ class SettingsDialog(QDialog):
         lbl_version.setWordWrap(True)
         v1.addWidget(lbl_version)
 
-        # —— 运行日志（展示最近处理记录） —— #
+        # —— 运行日志 —— #
         pg_logs = QWidget(); tabs.addTab(pg_logs, "运行日志")
         v2 = QVBoxLayout(pg_logs); v2.setSpacing(10)
         hint_logs = QLabel("记录错误与工作进程，可复制/导出，便于追踪处理过程。")
@@ -1811,7 +1941,6 @@ class DictionaryDialog(QDialog):
         body_layout.setContentsMargins(0, 0, 0, 0)
         body_layout.setSpacing(12)
 
-        # 左侧：院系快捷按钮 + 新增
         left_col = QVBoxLayout()
         left_col.setSpacing(8)
         left_col.addWidget(QLabel("院系快捷：点击切换，右键删除"))
@@ -1847,7 +1976,6 @@ class DictionaryDialog(QDialog):
 
         body_layout.addLayout(left_col, 1)
 
-        # 右侧：词条编辑区
         right_col = QVBoxLayout()
         right_col.setSpacing(8)
         right_col.addWidget(QLabel("词典编辑"))
@@ -1871,7 +1999,6 @@ class DictionaryDialog(QDialog):
         btns.rejected.connect(self.reject)
 
     def _refresh_dept_buttons(self):
-        # 清空旧按钮
         self.dept_btns = {}
         while self.dept_btn_layout.count():
             item = self.dept_btn_layout.takeAt(0)
@@ -2008,7 +2135,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"按楼栋拆分导出（界面一 / 界面二）  v{__version__}")
+        self.setWindowTitle(f"普查数据清洗软件  v{__version__}")
         self.setMinimumSize(1100, 760)
         self.qs = QSettings(self.ORG, self.APP)
         self.dept_dictionary = read_dictionary_setting(self.qs)
@@ -2017,23 +2144,24 @@ class MainWindow(QMainWindow):
 
         self.nav_buttons = []
 
-        # ===== 顶部提示区（按钮移至左侧导航） =====
         header = QFrame(self); header.setObjectName("TopPanel")
         header.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(24, 10, 24, 6)
         header_layout.setSpacing(10)
 
-        hdr_title = QLabel("按楼栋拆分导出 · 原始入口在左侧按钮列", self)
+        hdr_title = QLabel("普查数据清洗软件", self)
         hdr_title.setObjectName("HeaderTitle")
-        hdr_hint = QLabel("点击左列“原始数据输入”即可打开弹层，四个入口互不共用路径，请分别选择界面一/二、整改与简报文件。", self)
+        hdr_hint = QLabel(
+            "做这个软件的目的，就是为了摸鱼，其次，赠与恩师使用，如果有BUG，请联系作者本人，电话：15085629880，微信号：x57531，邮箱：891368650@qq.com，restoredefaults：恢复默认设置/OK：确认更改设置/cancel：取消更改。",
+            self
+        )
         hdr_hint.setObjectName("HeaderHint")
         hdr_hint.setWordWrap(True)
         header_layout.addWidget(hdr_title, 0, Qt.AlignLeft)
         header_layout.addWidget(hdr_hint, 0, Qt.AlignLeft)
         header_layout.addStretch(1)
 
-        # ===== 工作区：隐藏 TabBar，由左侧按钮切换 =====
         workspace_shell = QFrame(self)
         workspace_shell.setObjectName("WorkspaceShell")
         self.workspace_shell = workspace_shell
@@ -2063,7 +2191,10 @@ class MainWindow(QMainWindow):
 
         overlay_header = QHBoxLayout(); overlay_header.setSpacing(8)
         overlay_title = QLabel("原始数据输入面板", self); overlay_title.setObjectName("HeaderTitle")
-        overlay_tip = QLabel("支持界面一/界面二/整改/简报初稿文件，四个路径相互独立，可滚动查看完整输入项。", self)
+        overlay_tip = QLabel(
+            "支持 分表导出/楼栋遍历与排除 共用原始Excel，以及整改/简报初稿文件，路径相互独立，可滚动查看完整输入项。",
+            self
+        )
         overlay_tip.setObjectName("HeaderHint"); overlay_tip.setWordWrap(True)
         overlay_header.addWidget(overlay_title)
         overlay_header.addStretch(1)
@@ -2088,7 +2219,7 @@ class MainWindow(QMainWindow):
             QStyle, "SP_DialogOpenButton", None)
 
         self.input_edit = DropLineEdit(self)
-        self.input_edit.setPlaceholderText("界面一原始Excel（.xlsx / .xls）")
+        self.input_edit.setPlaceholderText("原始Excel（分表导出/楼栋遍历与排除 共用，.xlsx / .xls）")
         btn_in_side = QPushButton("浏览…", self)
         if sp_icon is not None:
             btn_in_side.setIcon(self.style().standardIcon(sp_icon))
@@ -2096,18 +2227,7 @@ class MainWindow(QMainWindow):
         row_input_side = QHBoxLayout(); row_input_side.setSpacing(8)
         row_input_side.addWidget(self.input_edit, 1)
         row_input_side.addWidget(btn_in_side)
-        scroll_layout.addRow("界面一原始：", row_input_side)
-
-        self.ui2_input_edit = DropLineEdit(self)
-        self.ui2_input_edit.setPlaceholderText("界面二原始数据（.xlsx / .xls）")
-        btn_in_ui2 = QPushButton("浏览…", self)
-        if sp_icon is not None:
-            btn_in_ui2.setIcon(self.style().standardIcon(sp_icon))
-        btn_in_ui2.clicked.connect(self.choose_input_ui2)
-        row_input2 = QHBoxLayout(); row_input2.setSpacing(8)
-        row_input2.addWidget(self.ui2_input_edit, 1)
-        row_input2.addWidget(btn_in_ui2)
-        scroll_layout.addRow("界面二原始：", row_input2)
+        scroll_layout.addRow("原始数据：", row_input_side)
 
         self.rect_input_edit = DropLineEdit(self)
         self.rect_input_edit.setPlaceholderText("整改清单（Excel / Word / PDF）")
@@ -2134,7 +2254,7 @@ class MainWindow(QMainWindow):
         scroll.setWidget(scroll_content)
         card_layout.addWidget(scroll, 1)
 
-        overlay_hint = QLabel("再点左侧按钮列中的“原始数据输入”即可收起浮层，下方按钮区域与工作区将重新可见。", self)
+        overlay_hint = QLabel("点击“收起”即可收起浮层，下方按钮区域与工作区将重新可见。", self)
         overlay_hint.setObjectName("HeaderHint")
         overlay_hint.setWordWrap(True)
         card_layout.addWidget(overlay_hint)
@@ -2148,7 +2268,6 @@ class MainWindow(QMainWindow):
         mask_layout.addStretch(1)
         overlay_layout.addWidget(overlay_mask)
 
-        # ===== 工作区主体 =====
         workspace = QFrame(self); workspace.setObjectName("Workspace")
         workspace_layout = QHBoxLayout(workspace)
         workspace_layout.setContentsMargins(0, 14, 0, 14)
@@ -2157,13 +2276,12 @@ class MainWindow(QMainWindow):
         workspace_layout_outer.addWidget(workspace)
         self.tabs = QTabWidget(self); self.tabs.setObjectName("WorkTabs"); self.tabs.tabBar().hide()
 
-        # --- 界面一 ---
-        tab1 = QWidget(self); self.tabs.addTab(tab1, "界面一")
+        tab1 = QWidget(self); self.tabs.addTab(tab1, "分表导出")
         t1_layout = QVBoxLayout(tab1); t1_layout.setContentsMargins(14, 14, 14, 14); t1_layout.setSpacing(12)
 
         card1 = QFrame(self); card1.setObjectName("Card")
         c1 = QVBoxLayout(card1); c1.setContentsMargins(16, 16, 16, 16); c1.setSpacing(12)
-        c1.addWidget(self._build_section_header("界面一 · 分表导出", "按楼栋拆分、序号公式、0 分标红与目录统计"))
+        c1.addWidget(self._build_section_header("分表导出", "按楼栋拆分、序号公式、0 分标红与目录统计（与 楼栋遍历与排除 共用原始数据）"))
         form1 = QFormLayout(); form1.setLabelAlignment(Qt.AlignRight)
 
         self.spin_max = QSpinBox(self); self.spin_max.setRange(1, 50)
@@ -2189,23 +2307,22 @@ class MainWindow(QMainWindow):
         form1.addRow("输出文件：", row1)
         c1.addLayout(form1)
 
-        self.btn_run1 = QPushButton("生成【界面一】", self); self.btn_run1.setObjectName("PrimaryButton")
+        self.btn_run1 = QPushButton("导出", self); self.btn_run1.setObjectName("PrimaryButton")
         self.btn_run1.setMinimumHeight(44)
         self.btn_run1.clicked.connect(self.start_run1)
         c1.addWidget(self.btn_run1)
 
-        tip1 = QLabel("分表（最多 N 个）、宿舍号升序、序号=ROW()-1、表头加粗；可对“数字0/文本0/文本0.0”分别标红。")
+        tip1 = QLabel("广告位")
         tip1.setObjectName("HelperText"); tip1.setWordWrap(True)
         c1.addWidget(tip1)
         t1_layout.addWidget(card1)
 
-        # --- 界面二 ---
-        tab2 = QWidget(self); self.tabs.addTab(tab2, "界面二")
+        tab2 = QWidget(self); self.tabs.addTab(tab2, "楼栋遍历与排除")
         t2_layout = QVBoxLayout(tab2); t2_layout.setContentsMargins(14, 14, 14, 14); t2_layout.setSpacing(12)
 
         card2 = QFrame(self); card2.setObjectName("Card")
         c2 = QVBoxLayout(card2); c2.setContentsMargins(16, 16, 16, 16); c2.setSpacing(12)
-        c2.addWidget(self._build_section_header("界面二 · 楼栋遍历与排除", "区间/单间排除、去零开关、院系判定与八大系部统计"))
+        c2.addWidget(self._build_section_header("楼栋遍历与排除", "区间/单间排除、去零开关、院系判定与八大系部统计（与 分表导出 共用原始数据）"))
         form2 = QFormLayout(); form2.setLabelAlignment(Qt.AlignRight)
 
         self.exclude_buildings = list(range(1, 4))
@@ -2224,7 +2341,7 @@ class MainWindow(QMainWindow):
         ex_head_row.addWidget(self.lbl_exclusion_summary, 1)
 
         self.chk_use_majority_dept = QCheckBox("寝室院系按人数占比判定（平局取首个院系）")
-        self.chk_drop_zero_text_ui2 = QCheckBox("排除文本 0/0.0")
+        self.chk_drop_zero_text_ui2 = QCheckBox("排除文本 0.0")
         self.chk_drop_zero_numeric_ui2 = QCheckBox("排除数值 0")
         self.chk_drop_zero_text_ui2.setChecked(True)
         self.chk_drop_zero_numeric_ui2.setChecked(True)
@@ -2237,7 +2354,7 @@ class MainWindow(QMainWindow):
         row2 = QHBoxLayout(); row2.addWidget(self.output_edit2); row2.addWidget(btn_out2)
 
         self.lbl_info_i2 = QLabel(
-            "界面二原始数据请在左侧“原始数据输入”弹窗中填写；区间/单间排除采用弹窗填写（兰/梅苑 1-3 栋），可选启用人数占比院系判定并分开排除文本/数值 0 分。")
+            "楼栋遍历与排除使用的原始数据即为左侧“原始数据输入”中选择的Excel；区间/单间排除采用弹窗填写（兰/梅苑 1-3 栋），可选启用人数占比院系判定，并分开排除文本 0.0 / 数值 0 分。")
         self.lbl_info_i2.setWordWrap(True)
 
         c2.addLayout(ex_head_row)
@@ -2252,18 +2369,17 @@ class MainWindow(QMainWindow):
         c2.addLayout(form2)
         c2.addWidget(self.lbl_info_i2)
 
-        self.btn_run2 = QPushButton("生成【界面二】", self); self.btn_run2.setObjectName("PrimaryButton")
+        self.btn_run2 = QPushButton("导出", self); self.btn_run2.setObjectName("PrimaryButton")
         self.btn_run2.setMinimumHeight(44)
         self.btn_run2.clicked.connect(self.start_run2)
         c2.addWidget(self.btn_run2)
 
-        tip2 = QLabel("将生成：①表一_优秀与不及格 ②表二_检查与各率 ③日志_口径与忽略说明。")
+        tip2 = QLabel("广告位")
         tip2.setObjectName("HelperText"); tip2.setWordWrap(True)
         c2.addWidget(tip2)
 
         t2_layout.addWidget(card2)
 
-        # --- 界面三：学风简报中心 ---
         tab3 = QWidget(self); self.tabs.addTab(tab3, "学风简报中心")
         t3_layout = QVBoxLayout(tab3); t3_layout.setContentsMargins(14, 14, 14, 14); t3_layout.setSpacing(12)
 
@@ -2298,7 +2414,7 @@ class MainWindow(QMainWindow):
         self.btn_run3.clicked.connect(self.start_run3)
         c3.addWidget(self.btn_run3)
 
-        tip3 = QLabel("根据“楼栋+宿舍号”或再加“院系”匹配整改寝室，生成精简版学风简报。")
+        tip3 = QLabel("广告位")
         tip3.setObjectName("HelperText"); tip3.setWordWrap(True)
         c3.addWidget(tip3)
 
@@ -2306,7 +2422,6 @@ class MainWindow(QMainWindow):
 
         self.tabs.currentChanged.connect(self._sync_nav_buttons)
 
-        # ===== 下半部分：按钮列 + 执行区 =====
         nav_panel = QFrame(self); nav_panel.setObjectName("NavPanel"); nav_panel.setMinimumWidth(220)
         nav_layout = QVBoxLayout(nav_panel)
         nav_layout.setContentsMargins(16, 16, 16, 16)
@@ -2322,8 +2437,8 @@ class MainWindow(QMainWindow):
 
         nav_layout.addWidget(raw_card)
 
-        nav_layout.addWidget(self._create_nav_entry("界面一", "", 0))
-        nav_layout.addWidget(self._create_nav_entry("界面二", "", 1))
+        nav_layout.addWidget(self._create_nav_entry("分表导出", "", 0))
+        nav_layout.addWidget(self._create_nav_entry("楼栋遍历与排除", "", 1))
         nav_layout.addWidget(self._create_nav_entry("简报中心", "", 2))
         nav_layout.addStretch(1)
 
@@ -2341,7 +2456,6 @@ class MainWindow(QMainWindow):
         workspace_layout.setStretch(0, 3)
         workspace_layout.setStretch(1, 10)
 
-        # ===== 底部状态栏 =====
         bottom = QFrame(self); bottom.setObjectName("BottomBar")
         bottom_layout = QHBoxLayout(bottom)
         bottom_layout.setContentsMargins(16, 10, 16, 10)
@@ -2368,7 +2482,6 @@ class MainWindow(QMainWindow):
         self.apply_theme()
         self._sync_nav_buttons(self.tabs.currentIndex())
 
-    # ---------------- 主题样式 ---------------- #
     def _qss(self, dark: bool) -> str:
         if not dark:
             accent = "#007AFF"; accent_hover = "#0A84FF"; accent_press = "#0051C6"
@@ -2519,15 +2632,6 @@ class MainWindow(QMainWindow):
             self.overlay_container.setGeometry(self.workspace_shell.rect())
             self._resize_overlay_card()
 
-    def _require_ui2_input_via_overlay(self) -> bool:
-        in_path = self.ui2_input_edit.text().strip()
-        if in_path and os.path.isfile(in_path):
-            return True
-        self._show_overlay()
-        self.ui2_input_edit.setFocus()
-        QMessageBox.information(self, "提示", "请在“原始数据输入”弹窗内选择界面二原始数据（.xlsx/.xls）。")
-        return False
-
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if hasattr(self, "overlay_container") and self.overlay_container.isVisible():
@@ -2539,7 +2643,6 @@ class MainWindow(QMainWindow):
         dark = (theme == "深色")
         self.setStyleSheet(self._qss(dark))
 
-    # ---------------- 区间/单间排除配置 ---------------- #
     def _load_exclusion_cfg(self):
         cfg = {"lan": {}, "mei": {}}
         for garden, prefix in (("lan", "ui2/ex/lan"), ("mei", "ui2/ex/mei")):
@@ -2631,10 +2734,8 @@ class MainWindow(QMainWindow):
             self._update_exclusion_summary()
             self.save_basic_settings()
 
-    # ---------------- 设置与持久化 ---------------- #
     def load_basic_settings(self):
         self.input_edit.setText(self.qs.value("input_path", ""))
-        self.ui2_input_edit.setText(self.qs.value("ui2/input", ""))
         self.rect_input_edit.setText(self.qs.value("rectify/path", ""))
         self.output_edit1.setText(self.qs.value("ui1/out", ""))
         self.output_edit2.setText(self.qs.value("ui2/out", ""))
@@ -2659,7 +2760,6 @@ class MainWindow(QMainWindow):
 
     def save_basic_settings(self):
         self.qs.setValue("input_path", self.input_edit.text().strip())
-        self.qs.setValue("ui2/input", self.ui2_input_edit.text().strip())
         self.qs.setValue("rectify/path", self.rect_input_edit.text().strip())
         self.qs.setValue("ui1/out", self.output_edit1.text().strip())
         self.qs.setValue("ui2/out", self.output_edit2.text().strip())
@@ -2717,7 +2817,6 @@ class MainWindow(QMainWindow):
         self.progress.setValue(value)
         self._log_progress(value)
 
-    # ---------------- 路径选择与默认目录 ---------------- #
     def _default_output_dir(self, input_path: str) -> str:
         d = self.qs.value("default_dir", "").strip()
         if d and os.path.isdir(d):
@@ -2725,23 +2824,20 @@ class MainWindow(QMainWindow):
         return os.path.dirname(input_path) if input_path else os.getcwd()
 
     def choose_input(self):
-        path, _ = QFileDialog.getOpenFileName(self, "选择原始 Excel", "", "Excel 文件 (*.xlsx *.xls)")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择原始 Excel（界面一 / 界面二 共用）",
+            "",
+            "Excel 文件 (*.xlsx *.xls)"
+        )
         if path:
             self.input_edit.setText(path)
             base = os.path.splitext(os.path.basename(path))[0]
             out_dir = self._default_output_dir(path)
             if not self.output_edit1.text():
-                self.output_edit1.setText(os.path.join(out_dir, f"{base}_界面一.xlsx"))
-            self.save_basic_settings()
-
-    def choose_input_ui2(self):
-        path, _ = QFileDialog.getOpenFileName(self, "选择界面二原始数据", "", "Excel 文件 (*.xlsx *.xls)")
-        if path:
-            self.ui2_input_edit.setText(path)
-            base = os.path.splitext(os.path.basename(path))[0]
-            out_dir = self._default_output_dir(path)
+                self.output_edit1.setText(os.path.join(out_dir, f"{base}_表一.xlsx"))
             if not self.output_edit2.text():
-                self.output_edit2.setText(os.path.join(out_dir, f"{base}_界面二.xlsx"))
+                self.output_edit2.setText(os.path.join(out_dir, f"{base}_表二.xlsx"))
             self.save_basic_settings()
 
     def choose_rectify_input(self):
@@ -2756,7 +2852,7 @@ class MainWindow(QMainWindow):
             self.save_basic_settings()
 
     def choose_output1(self):
-        path, _ = QFileDialog.getSaveFileName(self, "保存【界面一】Excel", self.output_edit1.text().strip(),
+        path, _ = QFileDialog.getSaveFileName(self, "保存 分表导出 Excel", self.output_edit1.text().strip(),
                                               "Excel 文件 (*.xlsx)")
         if path:
             if not path.lower().endswith(".xlsx"):
@@ -2765,7 +2861,7 @@ class MainWindow(QMainWindow):
             self.save_basic_settings()
 
     def choose_output2(self):
-        path, _ = QFileDialog.getSaveFileName(self, "保存【界面二】Excel", self.output_edit2.text().strip(),
+        path, _ = QFileDialog.getSaveFileName(self, "保存 楼栋遍历与排除 Excel", self.output_edit2.text().strip(),
                                               "Excel 文件 (*.xlsx)")
         if path:
             if not path.lower().endswith(".xlsx"):
@@ -2797,7 +2893,6 @@ class MainWindow(QMainWindow):
             self.brief_output_edit.setText(path)
             self.save_basic_settings()
 
-    # ---------------- 运行动作 ---------------- #
     def _excel_font_name(self) -> str:
         custom = str(self.qs.value("font_custom", "")).strip()
         base = str(self.qs.value("font_sel", "仿宋_GB2312") or "仿宋_GB2312").strip()
@@ -2828,10 +2923,12 @@ class MainWindow(QMainWindow):
         in_path = self.input_edit.text().strip()
         out_path = self.output_edit1.text().strip()
         if not in_path or not os.path.isfile(in_path):
-            QMessageBox.warning(self, "提示", "请先选择有效的输入 Excel 文件（.xlsx/.xls）。")
+            QMessageBox.warning(self, "提示", "请先在“原始数据输入”中选择有效的原始 Excel 文件（.xlsx/.xls）。")
+            self._show_overlay()
+            self.input_edit.setFocus()
             return
         if not out_path:
-            QMessageBox.warning(self, "提示", "请指定输出文件路径（.xlsx）。")
+            QMessageBox.warning(self, "提示", "请指定 分表导出 输出文件路径（.xlsx）。")
             return
 
         s = SettingsRun(
@@ -2851,7 +2948,7 @@ class MainWindow(QMainWindow):
         self.btn_run3.setEnabled(False)
         self.progress.setValue(5)
         self.last_progress_logged = 0
-        self._log_runtime(f"开始生成界面一：{os.path.basename(out_path)}")
+        self._log_runtime(f"开始生成分表导出数据：{os.path.basename(out_path)}")
 
         self.worker = Worker(s)
         self.worker.progress.connect(self.on_progress)
@@ -2860,16 +2957,15 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def start_run2(self):
-        in_path = self.ui2_input_edit.text().strip()
+        in_path = self.input_edit.text().strip()
         out_path = self.output_edit2.text().strip()
         if not in_path or not os.path.isfile(in_path):
-            if not self._require_ui2_input_via_overlay():
-                return
-            in_path = self.ui2_input_edit.text().strip()
-            if not in_path or not os.path.isfile(in_path):
-                return
+            QMessageBox.warning(self, "提示", "请先在“原始数据输入”中选择有效的原始 Excel 文件（.xlsx/.xls）。")
+            self._show_overlay()
+            self.input_edit.setFocus()
+            return
         if not out_path:
-            QMessageBox.warning(self, "提示", "请指定输出文件路径（.xlsx）。")
+            QMessageBox.warning(self, "提示", "请指定 楼栋遍历与排除 输出文件路径（.xlsx）。")
             return
 
         self.btn_run1.setEnabled(False)
@@ -2877,7 +2973,7 @@ class MainWindow(QMainWindow):
         self.btn_run3.setEnabled(False)
         self.progress.setValue(5)
         self.last_progress_logged = 0
-        self._log_runtime(f"开始生成界面二：{os.path.basename(out_path)}")
+        self._log_runtime(f"开始生成楼栋遍历与排除数据：{os.path.basename(out_path)}")
 
         dept_dict = deepcopy(self.dept_dictionary)
         fallback_df = None
@@ -2960,17 +3056,20 @@ class MainWindow(QMainWindow):
         self.progress.setValue(100)
         self.save_basic_settings()
         summary_msg = None
+
         if isinstance(self.worker, Worker):
             meta = getattr(self.worker, "summary", {}) or {}
             summary_msg = (
-                f"界面一完成：{os.path.basename(out_path)}；"
+                f"分表导出 完成：{os.path.basename(out_path)}；"
                 f"明细表={meta.get('sheet', '')}，有效行={meta.get('valid_rows', 0)}，"
-                f"楼栋表={meta.get('sheet_count', 0)}，0分明细={meta.get('zero_rows', 0)}。"
+                f"楼栋表={meta.get('sheet_count', 0)}，"
+                f"不及格条数={meta.get('fail_rows', 0)}，"
+                f"总分为0.0条数={meta.get('zero_rows', 0)}。"
             )
         elif isinstance(self.worker, WorkerIface2):
             stat = getattr(self.worker, "summary", {}) or {}
             summary_msg = (
-                f"界面二完成：{os.path.basename(out_path)}；"
+                f"楼栋遍历与排除 完成：{os.path.basename(out_path)}；"
                 f"原始行={stat.get('rows_raw', 0)}，结构化={stat.get('rows_after_structure', 0)}，"
                 f"去零后={stat.get('rows_after_zero', 0)}，排除后={stat.get('rows_after_exclusion', 0)}，"
                 f"最终计数={stat.get('rows_final', 0)}。"
@@ -2978,7 +3077,7 @@ class MainWindow(QMainWindow):
         elif isinstance(self.worker, WorkerBriefing):
             stat = getattr(self.worker, "summary", {}) or {}
             summary_msg = (
-                f"简报中心完成：{os.path.basename(out_path)}；"
+                f"简报中心 完成：{os.path.basename(out_path)}；"
                 f"初稿行={stat.get('report_rows', 0)}，整改行={stat.get('rect_rows', 0)}，"
                 f"剩余行={stat.get('remaining_rows', 0)}。"
             )
@@ -3000,7 +3099,6 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "错误", f"处理失败：\n{msg}")
 
 
-# 入口
 def main():
     os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
     app = QApplication(sys.argv)
